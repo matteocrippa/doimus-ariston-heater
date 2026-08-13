@@ -94,7 +94,15 @@ function buildCapabilities() {
 // UI code), so any plugin can adopt the same mechanism.
 function buildDescriptor() {
   const m = modeValues(variant);
-  const rows = [{ type: "toggle", key: "power", label: "On/Off" }];
+  const rows = [
+    {
+      type: "value",
+      key: "temperature",
+      label: "Current temperature",
+      unit: "celsius",
+    },
+    { type: "toggle", key: "power", label: "On/Off" },
+  ];
   if (hasShowers) {
     rows.push({
       type: "value",
@@ -104,23 +112,15 @@ function buildDescriptor() {
       secondary_key: "max_showers",
     });
   }
-  rows.push(
-    {
-      type: "stepper",
-      key: "target_temp",
-      label: "Target temperature",
-      min_key: "min_target_temp",
-      max_key: "max_target_temp",
-      step: 0.5,
-      unit: "celsius",
-    },
-    {
-      type: "value",
-      key: "temperature",
-      label: "Current temperature",
-      unit: "celsius",
-    },
-  );
+  rows.push({
+    type: "stepper",
+    key: "target_temp",
+    label: "Target temperature",
+    min_key: "min_target_temp",
+    max_key: "max_target_temp",
+    step: 0.5,
+    unit: "celsius",
+  });
   if (m.boost !== undefined) rows.push({ type: "toggle", key: "boost", label: "Boost" });
   if (m.imemory !== undefined) rows.push({ type: "toggle", key: "imemory", label: "iMemory" });
   if (m.scheduled !== undefined) rows.push({ type: "toggle", key: "scheduled", label: "Scheduled" });
