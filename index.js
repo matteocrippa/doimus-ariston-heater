@@ -4,6 +4,23 @@ function createLogger(api, prefix) {
   return (level, msg) => api.log(level, `[${prefix}] ${msg}`);
 }
 
+// Water-heater operating modes per API variant. Values follow the reverse-
+// engineered Ariston NET Velis API:
+//   Lydos (sePlantData):  iMemory=1, Green=2, Program=6, Boost=7
+//   Evo / Lux (medPlantData): Program=5, Boost=9
+//   other variants fall back to Program=5.
+const MODES = {
+  sePlantData: { imemory: 1, green: 2, program: 6, boost: 7 },
+  medPlantData: { program: 5, boost: 9 },
+  evoPlantData: { program: 5 },
+  slpPlantData: { program: 5 },
+  onePlantData: { program: 5 },
+};
+
+function modeValues(variant) {
+  return MODES[variant] || { program: 5 };
+}
+
 let client = null;
 let deviceId = null;
 let pollTimer = null;
@@ -12,11 +29,32 @@ let refreshTimer = null;
 let refreshInFlight = null;
 let consecutiveFailures = 0;
 let config = {};
+let debug = false;
 let minTemp = 40;
 let maxTemp = 65;
-let cached = { temperature: null, target_temp: null, heating_state: null };
+let cached = {
+  power: false,
+  temperature: null,
+  target_temp: null,
+  heating_state: null,
+  mode: null,
+  lastMode: null,
+  boost: false,
+  imemory: false,
+  scheduled: false,
+  green: false,
+  avShw: null,
+  maxAvShw: null,
+};
+let hasShowers = false;
 let apiRef = null;
 let log = null;
+
+// Registration bookkeeping — the UI descriptor and capabilities depend on the
+// discovered variant, so we re-register once the variant is known and whenever
+// the device starts reporting available-showers data.
+let registeredVariant = null;
+let registeredForShowers = false;
 
 // Adaptive polling state
 let plantId = null;
@@ -41,6 +79,97 @@ function generateUUID(seed) {
   ].join("-");
 }
 
+function buildCapabilities() {
+  const caps = ["power", "target_temp", "heating_state", "heating_mode", "mode"];
+  const m = modeValues(variant);
+  if (m.boost !== undefined) caps.push("boost");
+  if (m.imemory !== undefined) caps.push("imemory");
+  if (m.scheduled !== undefined) caps.push("scheduled");
+  if (m.green !== undefined) caps.push("green");
+  return caps;
+}
+
+// Declarative UI descriptor — instructs the mobile app how to render the
+// device-detail controls. The app renders this generically (no Ariston-specific
+// UI code), so any plugin can adopt the same mechanism.
+function buildDescriptor() {
+  const m = modeValues(variant);
+  const rows = [{ type: "toggle", key: "power", label: "On/Off" }];
+  if (hasShowers) {
+    rows.push({
+      type: "value",
+      key: "available_showers",
+      label: "Available showers",
+      format: "count/max",
+      secondary_key: "max_showers",
+    });
+  }
+  rows.push(
+    {
+      type: "stepper",
+      key: "target_temp",
+      label: "Target temperature",
+      min_key: "min_target_temp",
+      max_key: "max_target_temp",
+      step: 0.5,
+      unit: "celsius",
+    },
+    {
+      type: "value",
+      key: "temperature",
+      label: "Current temperature",
+      unit: "celsius",
+    },
+  );
+  if (m.boost !== undefined) rows.push({ type: "toggle", key: "boost", label: "Boost" });
+  if (m.imemory !== undefined) rows.push({ type: "toggle", key: "imemory", label: "iMemory" });
+  if (m.scheduled !== undefined) rows.push({ type: "toggle", key: "scheduled", label: "Scheduled" });
+  if (m.green !== undefined) rows.push({ type: "toggle", key: "green", label: "Green" });
+  return { sections: [{ title: "Water heater", rows }] };
+}
+
+function currentStateSnapshot() {
+  const state = {
+    power: !!cached.power,
+    heating_state: cached.heating_state ?? 0,
+    heating_mode: cached.heating_state ?? 0,
+    temperature: cached.temperature ?? 0,
+    target_temp: cached.target_temp ?? minTemp,
+    min_target_temp: minTemp,
+    max_target_temp: maxTemp,
+    mode: cached.mode ?? 0,
+    boost: !!cached.boost,
+    imemory: !!cached.imemory,
+    scheduled: !!cached.scheduled,
+    green: !!cached.green,
+  };
+  if (hasShowers) {
+    state.available_showers = cached.avShw ?? 0;
+    state.max_showers = cached.maxAvShw ?? 0;
+  }
+  return state;
+}
+
+function registerDevice() {
+  apiRef.registerDevice({
+    id: deviceId,
+    name: config.name || "Ariston Heater",
+    type: "thermostat",
+    capabilities: buildCapabilities(),
+    state: currentStateSnapshot(),
+    metadata: { ui: buildDescriptor(), icon: "thermostat" },
+  });
+}
+
+function syncRegistration() {
+  const needShowers = hasShowers && !registeredForShowers;
+  if (variant !== registeredVariant || needShowers) {
+    registeredVariant = variant;
+    registeredForShowers = hasShowers;
+    registerDevice();
+  }
+}
+
 module.exports = {
   start(cfg, api) {
     config = cfg;
@@ -58,7 +187,7 @@ module.exports = {
       1,
       Math.min(10, Number(config.cooldownCycles) || 3),
     );
-    const debug = !!config.debug;
+    debug = !!config.debug;
 
     const seed = "ariston-heater-" + (config.gateway || config.username);
     deviceId = generateUUID(seed);
@@ -78,38 +207,40 @@ module.exports = {
       cacheDir: process.cwd(),
     });
 
-    api.registerDevice({
-      id: deviceId,
-      name: config.name || "Ariston Heater",
-      type: "thermostat",
-      capabilities: [
-        "temperature",
-        "target_temp",
-        "heating_state",
-        "heating_mode",
-        "min_target_temp",
-        "max_target_temp",
-      ],
-      state: {
-        temperature: 0,
-        target_temp: minTemp,
-        heating_state: 0,
-        heating_mode: 0,
-        min_target_temp: minTemp,
-        max_target_temp: maxTemp,
-      },
-    });
-
     api.onCommand((id, key, value) => {
       if (id !== deviceId) return;
-
-      if (key === "target_temp") {
-        setTargetTemp(Number(value));
-      } else if (key === "heating_mode") {
-        const on = value === 1 || value === true;
-        setPower(on);
+      switch (key) {
+        case "target_temp":
+          setTargetTemp(Number(value));
+          break;
+        case "power":
+          setPower(value === true || value === 1 || value === "1" || value === "true");
+          break;
+        case "heating_mode":
+          setPower(value === 1 || value === true);
+          break;
+        case "boost":
+          setModeToggle("boost", isTruthy(value));
+          break;
+        case "imemory":
+          setModeToggle("imemory", isTruthy(value));
+          break;
+        case "scheduled":
+          setModeToggle("scheduled", isTruthy(value));
+          break;
+        case "green":
+          setModeToggle("green", isTruthy(value));
+          break;
+        case "mode":
+          setMode(Number(value));
+          break;
       }
     });
+
+    // Register immediately so the device shows up even if cloud init fails;
+    // the variant-aware capabilities + UI descriptor are applied once the
+    // variant is discovered (syncRegistration in initialize).
+    registerDevice();
 
     initialize();
   },
@@ -131,6 +262,9 @@ module.exports = {
     variant = null;
     prevHeatingState = null;
     cooldownRemaining = 0;
+    hasShowers = false;
+    registeredVariant = null;
+    registeredForShowers = false;
 
     // Recompute config-derived values
     minTemp = Math.max(1, Number(config.minTemp ?? 40));
@@ -144,7 +278,7 @@ module.exports = {
       1,
       Math.min(10, Number(config.cooldownCycles) || 3),
     );
-    const debug = !!config.debug;
+    debug = !!config.debug;
 
     // Recreate device ID in case gateway/username changed
     const seed = "ariston-heater-" + (config.gateway || config.username);
@@ -166,28 +300,7 @@ module.exports = {
       cacheDir: process.cwd(),
     });
 
-    // Re-register device with potentially new config values
-    apiRef.registerDevice({
-      id: deviceId,
-      name: config.name || "Ariston Heater",
-      type: "thermostat",
-      capabilities: [
-        "temperature",
-        "target_temp",
-        "heating_state",
-        "heating_mode",
-        "min_target_temp",
-        "max_target_temp",
-      ],
-      state: {
-        temperature: 0,
-        target_temp: minTemp,
-        heating_state: 0,
-        heating_mode: 0,
-        min_target_temp: minTemp,
-        max_target_temp: maxTemp,
-      },
-    });
+    registerDevice();
 
     initialize();
   },
@@ -206,6 +319,10 @@ module.exports = {
     client = null;
   },
 };
+
+function isTruthy(value) {
+  return value === true || value === 1 || value === "1" || value === "true";
+}
 
 // --- Adaptive Poll Timer ---
 
@@ -288,6 +405,18 @@ async function initialize() {
     variant = await client.discoverVariant(plantId);
     log("info", "Using variant: " + variant);
 
+    // Re-register with the variant-aware capabilities + UI descriptor.
+    syncRegistration();
+
+    // Debug aid: dump raw plant settings so field names can be confirmed for
+    // the user's device model.
+    if (debug) {
+      client.getPlantSettings(plantId, variant).then(
+        (settings) => log("debug", "Plant settings: " + JSON.stringify(settings)),
+        (e) => log("debug", "Plant settings unavailable: " + e.message),
+      );
+    }
+
     await refresh(plantId, variant);
     // Start with slow polling; refresh → updateState → maybeAdjustPolling will switch to fast if needed
     startPollTimer(slowPollInterval);
@@ -313,6 +442,7 @@ async function refresh(plantId, variant) {
     try {
       const data = await client.getPlantData(plantId, variant);
       if (data) {
+        if (debug) log("debug", "Plant data: " + JSON.stringify(data));
         updateState(data);
         consecutiveFailures = 0;
       } else {
@@ -338,6 +468,7 @@ async function refresh(plantId, variant) {
 
 function updateState(data) {
   const updates = {};
+  const m = modeValues(variant);
 
   if (typeof data.currentTemp === "number" && data.currentTemp > 0) {
     cached.temperature = data.currentTemp;
@@ -350,22 +481,53 @@ function updateState(data) {
   }
 
   // Accept boolean, numeric 1/0, or truthy/falsy for power state
-  // (client.js normalizes to boolean, but this guards against edge cases)
   if (data.power !== undefined && data.power !== null) {
     const newHeatingState = data.power ? 1 : 0;
+    const newPower = !!data.power;
     if (
       cached.heating_state !== newHeatingState ||
-      cached.heating_state === null
+      cached.power !== newPower
     ) {
+      cached.power = newPower;
       cached.heating_state = newHeatingState;
+      updates.power = newPower;
       updates.heating_state = newHeatingState;
       updates.heating_mode = newHeatingState;
     }
   }
 
+  // Mode drives the iMemory / Green / Scheduled / Boost toggles.
+  const mode = data.mode !== undefined && data.mode !== null ? data.mode : cached.mode;
+  if (mode !== cached.mode) {
+    cached.mode = mode;
+    if (cached.mode !== m.boost) cached.lastMode = cached.mode;
+    cached.boost = mode === m.boost;
+    cached.imemory = mode === m.imemory;
+    cached.scheduled = mode === m.scheduled;
+    cached.green = mode === m.green;
+    updates.mode = mode;
+    updates.boost = cached.boost;
+    updates.imemory = cached.imemory;
+    updates.scheduled = cached.scheduled;
+    updates.green = cached.green;
+  } else if (data.boost !== undefined && data.boost !== null && !!data.boost !== cached.boost) {
+    cached.boost = !!data.boost;
+    updates.boost = cached.boost;
+  }
+
+  if (data.avShw !== undefined && data.maxAvShw !== undefined) {
+    cached.avShw = data.avShw;
+    cached.maxAvShw = data.maxAvShw;
+    updates.available_showers = data.avShw;
+    updates.max_showers = data.maxAvShw;
+    hasShowers = true;
+  }
+
   if (Object.keys(updates).length > 0) {
     apiRef.updateDeviceState(deviceId, updates);
   }
+
+  syncRegistration();
 
   // Adjust polling rate based on heating state transitions
   const justStartedHeating =
@@ -428,7 +590,9 @@ async function setPower(on) {
 
   const prev = cached.heating_state;
   cached.heating_state = on ? 1 : 0;
+  cached.power = !!on;
   apiRef.updateDeviceState(deviceId, {
+    power: cached.power,
     heating_state: cached.heating_state,
     heating_mode: cached.heating_state,
   });
@@ -453,7 +617,9 @@ async function setPower(on) {
       refreshTimer = setTimeout(() => refreshIfReady(pid, v), 5000);
     } else {
       cached.heating_state = prev;
+      cached.power = prev === 1;
       apiRef.updateDeviceState(deviceId, {
+        power: cached.power,
         heating_state: prev,
         heating_mode: prev,
       });
@@ -461,12 +627,93 @@ async function setPower(on) {
     }
   } catch (e) {
     cached.heating_state = prev;
+    cached.power = prev === 1;
     apiRef.updateDeviceState(deviceId, {
+      power: cached.power,
       heating_state: prev,
       heating_mode: prev,
     });
     log("error", "Set power failed: " + e.message);
   }
+}
+
+// Turns one of the mode toggles on/off. iMemory / Green / Scheduled / Boost are
+// mutually exclusive operating modes on the device: turning one on switches the
+// mode; turning the active one off falls back to the previous/default mode.
+async function setModeToggle(key, on) {
+  const m = modeValues(variant);
+  const target = m[key];
+  if (target === undefined) {
+    log("warn", "Variant " + variant + " does not support " + key);
+    return;
+  }
+  if (on) {
+    await setMode(target);
+    return;
+  }
+  const fallback =
+    cached.lastMode ?? (m.scheduled ?? m.imemory ?? m.green ?? m.boost ?? m.program);
+  const newMode = fallback === cached.mode ? (m.scheduled ?? m.imemory ?? m.program) : fallback;
+  await setMode(newMode);
+}
+
+async function setMode(newMode) {
+  if (!client) return;
+  log("info", "Setting mode: " + newMode);
+
+  const prevMode = cached.mode;
+  const m = modeValues(variant);
+  cached.mode = newMode;
+  if (cached.mode !== m.boost) cached.lastMode = cached.mode;
+  cached.boost = newMode === m.boost;
+  cached.imemory = newMode === m.imemory;
+  cached.scheduled = newMode === m.scheduled;
+  cached.green = newMode === m.green;
+  apiRef.updateDeviceState(deviceId, {
+    mode: newMode,
+    boost: cached.boost,
+    imemory: cached.imemory,
+    scheduled: cached.scheduled,
+    green: cached.green,
+  });
+
+  try {
+    await client.login();
+    let pid = config.gateway || null;
+    if (!pid) pid = await client.discoverPlantId();
+    if (!pid) throw new Error("Cannot resolve plant ID");
+
+    const cachedVariant = client.storage.getVariant(pid);
+    const v = cachedVariant ? cachedVariant.variant : null;
+    if (!v) throw new Error("Cannot resolve variant");
+
+    const success = await client.setMode(pid, v, newMode);
+    if (success) {
+      refreshTimer = setTimeout(() => refreshIfReady(pid, v), 5000);
+    } else {
+      restoreMode(prevMode);
+      log("error", "Failed to set mode");
+    }
+  } catch (e) {
+    restoreMode(prevMode);
+    log("error", "Set mode failed: " + e.message);
+  }
+}
+
+function restoreMode(mode) {
+  const m = modeValues(variant);
+  cached.mode = mode;
+  cached.boost = mode === m.boost;
+  cached.imemory = mode === m.imemory;
+  cached.scheduled = mode === m.scheduled;
+  cached.green = mode === m.green;
+  apiRef.updateDeviceState(deviceId, {
+    mode: mode,
+    boost: cached.boost,
+    imemory: cached.imemory,
+    scheduled: cached.scheduled,
+    green: cached.green,
+  });
 }
 
 async function refreshIfReady(plantId, variant) {

@@ -208,6 +208,45 @@ class AristonClient {
     return res.status >= 200 && res.status < 300;
   }
 
+  // Reads the device's plant settings (anti-legionella, permanent boost, night
+  // mode, max setpoint, ...). Returns null when the endpoint is unavailable.
+  async getPlantSettings(plantId, variant) {
+    await this.login();
+    const url =
+      "velis/" + variant + "/" + encodeURIComponent(plantId) + "/plantSettings";
+    const res = await this.http.get(url);
+    if (
+      res.status >= 200 &&
+      res.status < 300 &&
+      res.data &&
+      typeof res.data === "object"
+    ) {
+      return res.data;
+    }
+    return null;
+  }
+
+  // Sets a single plant setting. oldValue is the value currently reported by
+  // the device (the API rejects optimistic writes without it).
+  async setPlantSetting(plantId, variant, name, value, oldValue) {
+    await this.login();
+    const url =
+      "velis/" + variant + "/" + encodeURIComponent(plantId) + "/plantSettings";
+    const res = await this.http.post(url, {
+      [name]: { new: value, old: oldValue },
+    });
+    return res.status >= 200 && res.status < 300;
+  }
+
+  // Sets the water heater operating mode (iMemory / Green / Program / Boost).
+  async setMode(plantId, variant, mode) {
+    await this.login();
+    const url =
+      "velis/" + variant + "/" + encodeURIComponent(plantId) + "/mode";
+    const res = await this.http.post(url, { new: mode });
+    return res.status >= 200 && res.status < 300;
+  }
+
   _parsePlantData(raw, variant) {
     // Normalize power to boolean — the Ariston API may return 1/0 (number),
     // true/false (boolean), or "1"/"0" (string) depending on device variant.
@@ -225,7 +264,9 @@ class AristonClient {
       antiLeg: raw.antiLeg ?? raw.antiLegionella,
       heatReq: raw.heatReq ?? raw.heatingReq,
       avShw: raw.avShw ?? raw.availableShowers,
+      maxAvShw: raw.maxAvShw ?? raw.maxShw ?? raw.maxAvailableShowers,
       mode: raw.mode,
+      boost: raw.boost ?? raw.boostOn,
     };
   }
 

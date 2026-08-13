@@ -6,11 +6,14 @@ Doimus native plugin for Ariston Velis / Lydos water heaters via the Ariston NET
 
 - Temperature monitoring (current and target)
 - Target temperature adjustment
-- Heating state (on/off) tracking and control
+- Power on/off
+- Water heater operating mode controls (iMemory, Green, Scheduled/Program, Boost — variant dependent)
+- Available-showers readout (when reported by the device)
+- Plugin-driven device-detail UI (`metadata.ui`) — the app renders the controls the plugin declares
 - **Adaptive polling**: fast when heating, slow when idle — no aggressive fixed-interval polling
 - Configurable poll intervals and cooldown behavior
 - Auto-discovery of plant ID (or manual override)
-- Debug logging
+- Debug logging (set `debug: true` to dump the raw plant data + settings for API field verification)
 
 ## Adaptive Polling
 
@@ -43,12 +46,26 @@ catches the thermal inertia after the element switches off.
 
 ## Device Capabilities
 
-| Capability | Description |
-|------------|-------------|
-| `temperature` | Current water temperature (°C) |
-| `target_temp` | Target temperature setpoint (°C) |
-| `heating_state` | 1 = heating, 0 = idle |
-| `heating_mode` | 1 = on, 0 = off |
+| Capability | Type | Description |
+|------------|------|-------------|
+| `power` | boolean | Heater on/off (writable) |
+| `target_temp` | number (°C) | Target temperature setpoint (writable) |
+| `mode` | number | Operating mode: iMemory/Green/Program/Boost (writable) |
+| `boost` | boolean | Boost mode active (writable) |
+| `imemory` | boolean | iMemory mode active (writable) |
+| `scheduled` | boolean | Scheduled/Program mode active (writable) |
+| `green` | boolean | Green mode active (writable) |
+| `heating_state` | number | 1 = heating, 0 = idle |
+| `heating_mode` | number | 1 = on, 0 = off |
+| `temperature` | number (°C) | Current water temperature (read-only) |
+| `available_showers` | number | Showers available now (read-only, when reported) |
+| `max_showers` | number | Total shower capacity (read-only, when reported) |
+| `min_target_temp` / `max_target_temp` | number | Setpoint bounds used by the stepper UI |
+
+Mode toggles (Boost/iMemory/Scheduled/Green) are mutually exclusive operating
+modes on the device: turning one on switches the mode; turning the active one off
+falls back to the previous mode. Not every mode is available on every variant —
+the plugin only exposes the modes the discovered API variant supports.
 
 ## License
 
