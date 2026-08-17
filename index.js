@@ -455,6 +455,26 @@ async function refresh(plantId, variant) {
     } catch (e) {
       consecutiveFailures++;
       log("warn", "Refresh error: " + (e.message || e));
+
+      // If a session gets stuck (e.g. stale/desynced token that hangs instead
+      // of cleanly returning 401), retrying the same session forever never
+      // recovers. After a few consecutive failures, force a full re-login +
+      // re-discovery instead of looping indefinitely.
+      const HARD_RESET_THRESHOLD = 3;
+      if (consecutiveFailures >= HARD_RESET_THRESHOLD) {
+        log(
+          "warn",
+          "Too many consecutive failures (" +
+            consecutiveFailures +
+            ") — forcing re-login and re-init",
+        );
+        consecutiveFailures = 0;
+        stopPollTimer();
+        refreshInFlight = null;
+        initialize();
+        return;
+      }
+
       const backoff = Math.min(300, 30 * consecutiveFailures);
       log("info", "Backing off for " + backoff + "s");
       await new Promise((r) => setTimeout(r, backoff * 1000));

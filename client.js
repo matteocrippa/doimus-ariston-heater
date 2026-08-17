@@ -29,7 +29,7 @@ class AristonClient {
       baseURL: opts.baseURL || API_BASE,
       timeout: DEFAULT_TIMEOUT_MS,
       headers: {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Doimus",
+        "User-Agent": "okhttp/4.9.3",
         "Content-Type": "application/json",
       },
       validateStatus: () => true,
