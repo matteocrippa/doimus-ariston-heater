@@ -131,6 +131,7 @@ function buildDescriptor() {
 function currentStateSnapshot() {
   const state = {
     power: !!cached.power,
+    heating: !!cached.heating,
     heating_state: cached.heating_state ?? 0,
     heating_mode: cached.heating_state ?? 0,
     temperature: cached.temperature ?? 0,
@@ -170,42 +171,43 @@ function syncRegistration() {
   }
 }
 
+function applyConfig(cfg) {
+  minTemp = Math.max(1, Number(cfg.minTemp ?? 40));
+  maxTemp = Math.max(minTemp + 1, Number(cfg.maxTemp ?? 65));
+  slowPollInterval = Math.max(300, Number(cfg.pollInterval) || 1800);
+  fastPollInterval = Math.max(30, Number(cfg.fastPollInterval) || 120);
+  if (fastPollInterval >= slowPollInterval) {
+    fastPollInterval = Math.max(30, Math.floor(slowPollInterval / 2));
+  }
+  cooldownCycles = Math.max(1, Math.min(10, Number(cfg.cooldownCycles) || 3));
+  debug = !!cfg.debug;
+
+  const seed = "ariston-heater-" + (cfg.gateway || cfg.username);
+  deviceId = generateUUID(seed);
+
+  client = new AristonClient({
+    username: cfg.username,
+    password: cfg.password,
+    log: {
+      info: (m) => log("info", m),
+      warn: (m) => log("warn", m),
+      error: (m) => log("error", m),
+      debug: (m) => {
+        if (debug) log("debug", m);
+      },
+    },
+    debug,
+    cacheDir: process.cwd(),
+  });
+}
+
 module.exports = {
   start(cfg, api) {
     config = cfg;
     apiRef = api;
     log = createLogger(api, "Ariston");
 
-    minTemp = Math.max(1, Number(config.minTemp ?? 40));
-    maxTemp = Math.max(minTemp + 1, Number(config.maxTemp ?? 65));
-    slowPollInterval = Math.max(300, Number(config.pollInterval) || 1800);
-    fastPollInterval = Math.max(30, Number(config.fastPollInterval) || 120);
-    if (fastPollInterval >= slowPollInterval) {
-      fastPollInterval = Math.max(30, Math.floor(slowPollInterval / 2));
-    }
-    cooldownCycles = Math.max(
-      1,
-      Math.min(10, Number(config.cooldownCycles) || 3),
-    );
-    debug = !!config.debug;
-
-    const seed = "ariston-heater-" + (config.gateway || config.username);
-    deviceId = generateUUID(seed);
-
-    client = new AristonClient({
-      username: config.username,
-      password: config.password,
-      log: {
-        info: (m) => log("info", m),
-        warn: (m) => log("warn", m),
-        error: (m) => log("error", m),
-        debug: (m) => {
-          if (debug) log("debug", m);
-        },
-      },
-      debug,
-      cacheDir: process.cwd(),
-    });
+    applyConfig(cfg);
 
     api.onCommand((id, key, value) => {
       if (id !== deviceId) return;
@@ -248,14 +250,12 @@ module.exports = {
   setConfig(cfg) {
     config = cfg;
 
-    // Cancel any pending retry or poll
     if (retryTimer) {
       clearTimeout(retryTimer);
       retryTimer = null;
     }
     stopPollTimer();
 
-    // Reset state
     consecutiveFailures = 0;
     refreshInFlight = null;
     plantId = null;
@@ -266,42 +266,8 @@ module.exports = {
     registeredVariant = null;
     registeredForShowers = false;
 
-    // Recompute config-derived values
-    minTemp = Math.max(1, Number(config.minTemp ?? 40));
-    maxTemp = Math.max(minTemp + 1, Number(config.maxTemp ?? 65));
-    slowPollInterval = Math.max(300, Number(config.pollInterval) || 1800);
-    fastPollInterval = Math.max(30, Number(config.fastPollInterval) || 120);
-    if (fastPollInterval >= slowPollInterval) {
-      fastPollInterval = Math.max(30, Math.floor(slowPollInterval / 2));
-    }
-    cooldownCycles = Math.max(
-      1,
-      Math.min(10, Number(config.cooldownCycles) || 3),
-    );
-    debug = !!config.debug;
-
-    // Recreate device ID in case gateway/username changed
-    const seed = "ariston-heater-" + (config.gateway || config.username);
-    deviceId = generateUUID(seed);
-
-    // Create new client with updated credentials
-    client = new AristonClient({
-      username: config.username,
-      password: config.password,
-      log: {
-        info: (m) => log("info", m),
-        warn: (m) => log("warn", m),
-        error: (m) => log("error", m),
-        debug: (m) => {
-          if (debug) log("debug", m);
-        },
-      },
-      debug,
-      cacheDir: process.cwd(),
-    });
-
+    applyConfig(cfg);
     registerDevice();
-
     initialize();
   },
 
@@ -500,17 +466,32 @@ function updateState(data) {
     updates.target_temp = cached.target_temp;
   }
 
-  // Accept boolean, numeric 1/0, or truthy/falsy for power state
+  // Accept boolean, numeric 1/0, or truthy/falsy for power state.
+  // Power is the device's "switched on" flag, kept distinct from heating_state
+  // (which tracks the heating element actually running — see heatReq below).
   if (data.power !== undefined && data.power !== null) {
-    const newHeatingState = data.power ? 1 : 0;
     const newPower = !!data.power;
+    if (cached.power !== newPower) {
+      cached.power = newPower;
+      updates.power = newPower;
+    }
+  }
+
+  // Cloud reports `heatReq` when the heating element is actively running.
+  // Surface both the boolean (`heating`) and numeric (`heating_state`,
+  // `heating_mode`) forms so the mobile dashboard's predicate matches the
+  // documented thermostat contract.
+  if (data.heatReq !== undefined && data.heatReq !== null) {
+    const newHeating = !!data.heatReq;
+    const newHeatingState = newHeating ? 1 : 0;
     if (
       cached.heating_state !== newHeatingState ||
-      cached.power !== newPower
+      cached.heating !== newHeating
     ) {
-      cached.power = newPower;
+      cached.heating = newHeating;
       cached.heating_state = newHeatingState;
-      updates.power = newPower;
+      cached.heating_mode = newHeatingState;
+      updates.heating = newHeating;
       updates.heating_state = newHeatingState;
       updates.heating_mode = newHeatingState;
     }
